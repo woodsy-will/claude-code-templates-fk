@@ -25,9 +25,9 @@ vercel --prod                  # Deploy to production
 
 ## Security Guidelines
 
-### ⛔ CRITICAL: NEVER Hardcode Secrets
+### ⛔ CRITICAL: NEVER Hardcode Secrets or IDs
 
-**NEVER write API keys, tokens, or passwords in code.**
+**NEVER write API keys, tokens, passwords, project IDs, org IDs, or any identifier in code.** This includes Vercel project/org IDs, Supabase URLs, Discord IDs, database connection strings, and any other infrastructure identifier. ALL must go in `.env`.
 
 ```javascript
 // ❌ WRONG
@@ -148,21 +148,38 @@ python scripts/generate_components_json.py
 # 2. Run tests
 npm test
 
-# 3. Bump version
-npm version patch  # 1.20.2 -> 1.20.3
+# 3. Check current npm version and align local version
+npm view claude-code-templates version  # check latest on registry
+# Edit package.json version to be one patch above the registry version
 
-# 4. Publish
+# 4. Commit version bump and push
+git add package.json && git commit -m "chore: Bump version to X.Y.Z"
+git push origin main
+
+# 5. Publish to npm (requires granular access token with "Bypass 2FA" enabled)
+npm config set //registry.npmjs.org/:_authToken=YOUR_GRANULAR_TOKEN
 npm publish
+npm config delete //registry.npmjs.org/:_authToken  # always clean up after
 
-# 5. Deploy website
+# 6. Tag the release
+git tag vX.Y.Z && git push origin vX.Y.Z
+
+# 7. Deploy website
 vercel --prod
 ```
+
+**npm Publishing Notes:**
+- Classic npm tokens were revoked Dec 2025. Use **granular access tokens** from [npmjs.com/settings/~/tokens](https://www.npmjs.com/settings/~/tokens)
+- The token must have **Read and Write** permissions for `claude-code-templates` and **"Bypass 2FA"** enabled
+- Always remove the token from npm config after publishing (`npm config delete`)
+- The local `package.json` version may drift from npm if published from CI — always check `npm view claude-code-templates version` first
+- Never hardcode or commit tokens
 
 ## API Architecture
 
 ### Critical Endpoints
 
-The `/api` directory contains Vercel Serverless Functions:
+API endpoints live as Astro API routes in `dashboard/src/pages/api/`:
 
 **`/api/track-download-supabase`** (CRITICAL)
 - Tracks component downloads for analytics
@@ -175,30 +192,134 @@ The `/api` directory contains Vercel Serverless Functions:
 
 **`/api/claude-code-check`**
 - Monitors Claude Code releases
-- Vercel Cron: every 4 hours
-- Database: Neon (claude_code_versions table)
+- Vercel Cron: every 30 minutes
+- Database: Neon (claude_code_versions, claude_code_changes, discord_notifications_log, monitoring_metadata tables)
 
-### Deployment Workflow
+### Shared API Libraries
 
-**ALWAYS test before deploying:**
+- `dashboard/src/lib/api/cors.ts` — CORS headers, `corsResponse()`, `jsonResponse()`
+- `dashboard/src/lib/api/neon.ts` — Neon client factory
+- `dashboard/src/lib/api/auth.ts` — Clerk JWT verification
+- `dashboard/src/lib/api/changelog-parser.ts` — Claude Code changelog parser
+
+### Emergency Rollback
 
 ```bash
-# 1. Run API tests
-cd api
-npm test
-
-# 2. If tests pass, deploy
-cd ..
-vercel --prod
-
-# 3. Monitor logs
-vercel logs aitmpl.com --follow
+vercel ls                              # List deployments
+vercel promote <previous-deployment>   # Rollback
 ```
+
+## Cloudflare Workers
+
+The `cloudflare-workers/` directory contains Cloudflare Worker projects that run independently from Vercel.
+
+### docs-monitor
+
+Monitors https://code.claude.com/docs for changes every hour and sends Telegram notifications.
+
+```bash
+cd cloudflare-workers/docs-monitor
+npm run dev          # Local dev
+npx wrangler deploy  # Deploy
+```
+
+### pulse (Weekly KPI Report)
+
+Collects metrics from GitHub, Discord, Supabase, Vercel, and Google Analytics every Sunday at 14:00 UTC and sends a consolidated report via Telegram.
+
+**Architecture:** Single `index.js` file (no npm dependencies at runtime). All source collectors, formatter, and Telegram sender in one file.
+
+**Cron:** `0 14 * * 0` (Sundays 14:00 UTC / 11:00 AM Chile)
+
+```bash
+cd cloudflare-workers/pulse
+npm run dev          # Local dev
+npx wrangler deploy  # Deploy
+
+# Manual trigger
+curl -X POST https://pulse-weekly-report.SUBDOMAIN.workers.dev/trigger \
+  -H "Authorization: Bearer $TRIGGER_SECRET"
+
+# Test single source
+curl -X POST "https://pulse-weekly-report.SUBDOMAIN.workers.dev/trigger?source=github" \
+  -H "Authorization: Bearer $TRIGGER_SECRET"
+
+# Dry run (no Telegram)
+curl -X POST "https://pulse-weekly-report.SUBDOMAIN.workers.dev/trigger?send=false" \
+  -H "Authorization: Bearer $TRIGGER_SECRET"
+```
+
+**Secrets (Cloudflare):**
+```bash
+TELEGRAM_BOT_TOKEN          # Shared with docs-monitor
+TELEGRAM_CHAT_ID            # Shared with docs-monitor
+GITHUB_TOKEN                # GitHub PAT (public_repo scope)
+SUPABASE_URL                # Supabase project URL
+SUPABASE_SERVICE_ROLE_KEY   # Supabase service role key
+DISCORD_BOT_TOKEN           # Discord bot token
+DISCORD_GUILD_ID            # Discord server ID
+VERCEL_TOKEN                # Vercel personal access token (optional)
+VERCEL_PROJECT_ID           # Vercel project ID (optional)
+TRIGGER_SECRET              # For manual /trigger endpoint
+GA_PROPERTY_ID              # GA4 property ID (optional)
+GA_SERVICE_ACCOUNT_JSON     # Base64 service account (optional)
+```
+
+**Graceful degradation:** Each source catches its own errors. Missing secrets or API failures show `⚠️ Unavailable` instead of crashing the report.
+
+## Dashboard (www.aitmpl.com)
+
+Astro + React + Tailwind dashboard serving both `www.aitmpl.com` and `app.aitmpl.com`. Clerk auth for user collections. Source lives in `dashboard/`. All API endpoints are Astro API routes in the same project.
+
+### Architecture
+
+- **Framework**: Astro 5 with React islands, Tailwind v4, `output: 'server'`
+- **Auth**: Clerk (`window.Clerk` global, no ClerkProvider per island)
+- **Data**: `components.json` and `trending-data.json` served from `dashboard/public/` (same-origin)
+- **APIs**: All endpoints in `dashboard/src/pages/api/` (Astro API routes, no separate serverless project)
+
+### Vercel Project Setup
+
+Single Vercel project serves all domains:
+
+| Project | Domains | Root Directory |
+|---------|---------|----------------|
+| `aitmpl-dashboard` | `www.aitmpl.com`, `aitmpl.com` (redirect), `app.aitmpl.com` | `dashboard` |
+
+The legacy root project (`aitmpl`) is archived — only its `.vercel.app` subdomain remains.
+
+### Deployment
+
+**ALWAYS use the deployer agent (`.claude/agents/deployer.md`) for all deployments.** It runs pre-deploy checks (auth, git status, API tests) and handles the full pipeline safely. Never deploy manually.
+
+```bash
+npm run deploy             # Deploy www + app.aitmpl.com
+npm run deploy:dashboard   # Same as above
+```
+
+**CI/CD**: Pushes to `main` auto-deploy via GitHub Actions (`.github/workflows/deploy.yml`):
+- Changes in `dashboard/**` trigger deploy
+
+**Required GitHub Secrets** (Settings > Secrets > Actions):
+- `VERCEL_TOKEN` — Vercel personal access token
+- `VERCEL_ORG_ID` — Vercel org/team ID
+- `VERCEL_DASHBOARD_PROJECT_ID` — Project ID for aitmpl-dashboard
 
 ### Environment Variables (Vercel)
 
 ```bash
-# Supabase
+# Clerk
+PUBLIC_CLERK_PUBLISHABLE_KEY=xxx
+CLERK_SECRET_KEY=xxx
+
+# Data
+PUBLIC_COMPONENTS_JSON_URL=/components.json
+
+# GitHub OAuth
+PUBLIC_GITHUB_CLIENT_ID=xxx
+GITHUB_CLIENT_SECRET=xxx
+
+# Supabase (download tracking)
 SUPABASE_URL=https://xxx.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=xxx
 
@@ -212,30 +333,42 @@ DISCORD_PUBLIC_KEY=xxx
 DISCORD_WEBHOOK_URL_CHANGELOG=https://discord.com/api/webhooks/xxx
 ```
 
-### Emergency Rollback
+### Known Issues & Solutions
+
+**Node v24 breaks `fs.writeFileSync` on Vercel**
+- Node v24 has a bug with `writeFileSync` in Vercel's build environment
+- Solution: Dashboard project is pinned to Node 22.x (set via Vercel API/dashboard)
+
+**Vercel CLI ignores local `.vercel/project.json`**
+- The CLI often resolves to the parent directory's project. Use `VERCEL_ORG_ID` and `VERCEL_PROJECT_ID` env vars to force the correct project.
+
+### Local Development
 
 ```bash
-vercel ls                              # List deployments
-vercel promote <previous-deployment>   # Rollback
+cd dashboard
+npm install
+npx astro dev --port 4321   # Dashboard + APIs at http://localhost:4321
 ```
 
-## Website Architecture (docs/)
+## Data Files
 
-Static website at https://aitmpl.com for browsing components.
+### Component Catalog
 
-### Key Files
-
-- `docs/components.json` - Component catalog (generated, ~2MB)
-- `docs/index.html` - Main component browser
-- `docs/blog/` - Blog articles
-- `docs/js/` - Vanilla JavaScript (data-loader, search, cart)
+- `docs/components.json` — Generated catalog (source of truth)
+- `dashboard/public/components.json` — Copy served by the dashboard
+- `dashboard/public/trending-data.json` — Trending/download stats
 
 ### Data Flow
 
 1. `scripts/generate_components_json.py` scans `cli-tool/components/`
 2. Generates `docs/components.json` with embedded content
-3. Website loads JSON and renders component cards
-4. Download tracking via `/api/track-download-supabase`
+3. Copy to `dashboard/public/components.json` for the dashboard to serve
+4. Dashboard loads JSON and renders component cards
+5. Download tracking via `/api/track-download-supabase`
+
+### Legacy Static Site (docs/)
+
+The `docs/` directory contains the old static HTML site (no longer deployed to www). Blog articles in `docs/blog/` are still referenced externally.
 
 ### Blog Article Creation
 
@@ -275,7 +408,6 @@ This automatically:
 npm test                 # Run all tests
 npm run test:watch      # Watch mode
 npm run test:coverage   # Coverage report
-cd api && npm test      # Test API endpoints
 ```
 
 Aim for 70%+ test coverage. Test critical paths and error handling.
@@ -283,8 +415,8 @@ Aim for 70%+ test coverage. Test critical paths and error handling.
 ## Common Issues
 
 **API endpoint returns 404 after deploy**
-- Serverless functions must be in `/api/` directory
-- Use format: `/api/function-name.js` or `/api/folder/index.js`
+- API routes must be in `dashboard/src/pages/api/` as Astro API routes
+- Export named HTTP methods: `export const POST: APIRoute`, `export const GET: APIRoute`
 
 **Download tracking not working**
 - Check Vercel logs: `vercel logs aitmpl.com --follow`
@@ -293,8 +425,8 @@ Aim for 70%+ test coverage. Test critical paths and error handling.
 
 **Components not updating on website**
 - Run `python scripts/generate_components_json.py`
-- Clear browser cache
-- Check `docs/components.json` file size
+- Copy `docs/components.json` to `dashboard/public/components.json`
+- Deploy and clear browser cache
 
 ## Important Notes
 
